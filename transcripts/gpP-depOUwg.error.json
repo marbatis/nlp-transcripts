@@ -1,0 +1,5 @@
+{
+  "video_id": "gpP-depOUwg",
+  "error_type": "TranscriptDownloadError",
+  "message": "Network error while downloading transcript for gpP-depOUwg: <urlopen error Tunnel connection failed: 403 Forbidden>"
+}
