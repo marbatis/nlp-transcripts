@@ -1,0 +1,5 @@
+{
+  "video_id": "Mz8-LTednt4",
+  "error_type": "TranscriptDownloadError",
+  "message": "Network error while downloading transcript for Mz8-LTednt4: <urlopen error Tunnel connection failed: 403 Forbidden>"
+}

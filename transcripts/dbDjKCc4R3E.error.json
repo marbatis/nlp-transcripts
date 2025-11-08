@@ -1,0 +1,5 @@
+{
+  "video_id": "dbDjKCc4R3E",
+  "error_type": "TranscriptDownloadError",
+  "message": "Network error while downloading transcript for dbDjKCc4R3E: <urlopen error Tunnel connection failed: 403 Forbidden>"
+}
