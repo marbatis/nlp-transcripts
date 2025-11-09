@@ -1,10 +1,23 @@
 """Utility for downloading YouTube video transcripts.
 
 This script reads newline separated YouTube video URLs or IDs from an input
-file and stores each transcript inside the provided output directory.  Each
+file and stores each transcript inside the provided output directory. Each
 transcript is written as a plain text file named after the video id.
 
-Example usage:
+The implementation combines several public techniques collected while
+researching how to obtain transcripts from blocked or otherwise restricted
+videos:
+
+* The historic ``timedtext`` endpoint for first-party caption tracks
+* The ``youtube-transcript-api`` project for auto-generated subtitles
+* ``yt-dlp`` as a final fallback able to download a wide range of caption
+  formats
+
+Only freely available libraries are required and both geo-blocks and missing
+auto captions are handled more gracefully than before.
+
+Example usage::
+
     python scripts/extract_transcripts.py video_urls.txt transcripts/
 """
 from __future__ import annotations
@@ -12,9 +25,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
@@ -108,14 +122,193 @@ def _download_json_transcript(video_id: str, language: str) -> Optional[str]:
     return transcript or None
 
 
-def fetch_transcript(video_id: str) -> str:
+def _fetch_with_timedtext(video_id: str) -> str:
+    """Try fetching the transcript via the timedtext endpoint."""
+
     for language in LANGUAGE_CANDIDATES:
         transcript = _download_json_transcript(video_id, language)
         if transcript:
+            LOGGER.debug(
+                "Retrieved transcript for %s using timedtext language %s",
+                video_id,
+                language,
+            )
             return transcript
     raise TranscriptNotAvailableError(
         f"Transcript not available in languages {LANGUAGE_CANDIDATES}"
     )
+
+
+def _fetch_with_youtube_transcript_api(video_id: str) -> str:
+    """Fetch transcript using the youtube-transcript-api package."""
+
+    try:
+        from youtube_transcript_api import (  # type: ignore
+            NoTranscriptFound,
+            TranscriptsDisabled,
+            VideoUnavailable,
+            YouTubeTranscriptApi,
+        )
+    except ImportError as err:  # pragma: no cover - optional dependency
+        raise TranscriptDownloadError(
+            "youtube-transcript-api is not installed"
+        ) from err
+
+    try:
+        segments = YouTubeTranscriptApi.get_transcript(
+            video_id, languages=list(LANGUAGE_CANDIDATES)
+        )
+    except (NoTranscriptFound, TranscriptsDisabled) as err:
+        raise TranscriptNotAvailableError(str(err)) from err
+    except VideoUnavailable as err:
+        raise TranscriptDownloadError(f"Video unavailable: {err}") from err
+    except Exception as err:  # pragma: no cover - defensive
+        raise TranscriptDownloadError(
+            f"youtube-transcript-api failed for {video_id}: {err}"
+        ) from err
+
+    lines = []
+    for segment in segments:
+        text = (segment.get("text") or "").replace("\n", " ").strip()
+        if text:
+            lines.append(text)
+
+    transcript = "\n".join(lines).strip()
+    if not transcript:
+        raise TranscriptNotAvailableError(
+            "youtube-transcript-api returned an empty transcript"
+        )
+
+    LOGGER.debug("Retrieved transcript for %s using youtube-transcript-api", video_id)
+    return transcript
+
+
+def _parse_caption_payload(payload: str, extension: str) -> Optional[str]:
+    """Convert a caption payload into plain text."""
+
+    if not payload.strip():
+        return None
+
+    if extension == "json3":
+        data = json.loads(payload)
+        events = data.get("events", [])
+        lines = []
+        for event in events:
+            for segment in event.get("segs", []) or []:
+                text = (segment.get("utf8") or "").replace("\n", " ").strip()
+                if text:
+                    lines.append(text)
+        return "\n".join(lines).strip() or None
+
+    lines = []
+    for line in payload.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "-->" in line:
+            continue
+        if extension == "srt" and line.isdigit():
+            continue
+        if line.upper().startswith("WEBVTT"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip() or None
+
+
+@dataclass
+class CaptionCandidate:
+    url: str
+    extension: str
+
+
+def _iter_caption_candidates(info: dict) -> Iterable[CaptionCandidate]:
+    """Yield caption download candidates from a yt-dlp info dict."""
+
+    for language in LANGUAGE_CANDIDATES:
+        for store in ("subtitles", "automatic_captions"):
+            tracks = info.get(store, {}).get(language, [])
+            for track in tracks:
+                url = track.get("url")
+                ext = track.get("ext")
+                if not url or not ext:
+                    continue
+                yield CaptionCandidate(url=url, extension=ext)
+
+
+def _fetch_with_yt_dlp(video_id: str) -> str:
+    """Fetch transcript information via yt-dlp."""
+
+    try:
+        from yt_dlp import YoutubeDL  # type: ignore
+    except ImportError as err:  # pragma: no cover - optional dependency
+        raise TranscriptDownloadError("yt-dlp is not installed") from err
+
+    ydl_options = {
+        "quiet": True,
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "logger": LOGGER,
+    }
+
+    with YoutubeDL(ydl_options) as ydl:
+        info = ydl.extract_info(video_id, download=False)
+
+    for candidate in _iter_caption_candidates(info):
+        try:
+            with urlopen(candidate.url, timeout=10) as response:  # nosec B310
+                payload = response.read().decode("utf-8", errors="ignore")
+        except HTTPError as err:
+            if err.code in {403, 404}:
+                continue
+            raise TranscriptDownloadError(
+                f"HTTP error {err.code} downloading yt-dlp captions for {video_id}"
+            ) from err
+        except URLError as err:
+            raise TranscriptDownloadError(
+                f"Network error downloading yt-dlp captions for {video_id}: {err}"
+            ) from err
+
+        transcript = _parse_caption_payload(payload, candidate.extension)
+        if transcript:
+            LOGGER.debug(
+                "Retrieved transcript for %s using yt-dlp track (%s)",
+                video_id,
+                candidate.extension,
+            )
+            return transcript
+
+    raise TranscriptNotAvailableError(
+        "yt-dlp did not return usable caption tracks"
+    )
+
+
+def fetch_transcript(video_id: str) -> str:
+    """Attempt to fetch a transcript using multiple public techniques."""
+
+    strategies = (
+        _fetch_with_timedtext,
+        _fetch_with_youtube_transcript_api,
+        _fetch_with_yt_dlp,
+    )
+    last_error: Optional[Exception] = None
+
+    for strategy in strategies:
+        try:
+            return strategy(video_id)
+        except TranscriptNotAvailableError as err:
+            LOGGER.debug("Strategy %s did not have a transcript: %s", strategy.__name__, err)
+            last_error = err
+        except TranscriptDownloadError as err:
+            LOGGER.debug("Strategy %s failed to download transcript: %s", strategy.__name__, err)
+            last_error = err
+
+    if isinstance(last_error, TranscriptNotAvailableError):
+        raise last_error
+    if last_error:
+        raise TranscriptDownloadError(str(last_error))
+
+    raise TranscriptDownloadError("Unable to fetch transcript for unknown reasons")
 
 
 def save_transcript(destination: Path, video_id: str, transcript: str) -> None:
